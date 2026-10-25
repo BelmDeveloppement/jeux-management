@@ -122,7 +122,9 @@ function Host(code,onMsg,onClose){
   const conns={}, peer=new Peer('BH-'+code,PO);
   const ready=new Promise((ok,ko)=>{ peer.on('open',ok); peer.on('error',ko); });
   peer.on('connection',c=>{ c.on('open',()=>{ conns[c.peer]=c; }); c.on('data',d=>onMsg(c.peer,d)); c.on('close',()=>{ delete conns[c.peer]; onClose(c.peer); }); });
-  return {ready, send:(to,m)=>{ const c=conns[to]; if(c&&c.open) c.send(m); }, broadcast:m=>Object.values(conns).forEach(c=>{ if(c.open) c.send(m); }), destroy:()=>{ try{peer.destroy()}catch(e){} }};
+  peer.on('disconnected',()=>{ setTimeout(()=>{ try{ if(!peer.destroyed) peer.reconnect(); }catch(e){} },1500); });
+  return {ready, ok:()=>peer.open&&!peer.disconnected&&!peer.destroyed, dead:()=>peer.destroyed, reconnect:()=>{ try{ if(peer.disconnected&&!peer.destroyed) peer.reconnect(); }catch(e){} },
+    send:(to,m)=>{ const c=conns[to]; if(c&&c.open) c.send(m); }, broadcast:m=>Object.values(conns).forEach(c=>{ if(c.open) c.send(m); }), destroy:()=>{ try{peer.destroy()}catch(e){} }};
 }
 function Client(code,onMsg,onLost){
   const peer=new Peer(undefined,PO); let c=null;
@@ -196,20 +198,20 @@ function viewJoin(prefill,g){
   };
 }
 function connectPlayer(first){
-  P.lost=false;
+  if(first) P.lost=false;
   if(P.cli){ P.cli.destroy(); }
-  const cli=Client(P.code,m=>{ if(m && m.t==='state') onState(m); },()=>{ if(P.cli!==cli||ROLE!=='player') return; P.lost=true; renderPlayer(); scheduleRetry(); });
+  const cli=Client(P.code,m=>{ P.last=Date.now(); if(m && m.t==='state') onState(m); },()=>{ if(P.cli!==cli||ROLE!=='player') return; P.lost=true; renderPlayer(); scheduleRetry(); });
   P.cli=cli;
-  cli.ready.then(()=>{ ROLE='player'; cli.send({t:'hello',pid:P.pid,name:P.name}); if(P.sel!=null) sendVote(); renderPlayer(); },e=>{
+  cli.ready.then(()=>{ ROLE='player'; try{ sessionStorage.setItem('bh-act','1'); }catch(e){} P.lost=false; P.last=Date.now(); cli.send({t:'hello',pid:P.pid,name:P.name}); if(P.sel!=null) sendVote(); renderPlayer(); },e=>{
     if(first){
       const el=$('#je'); if(!el) return;
       el.hidden=false; el.textContent=(e&&e.type==='peer-unavailable')?'Code inconnu. Vérifie le code affiché chez l’animateur.':'Connexion impossible. Vérifie le réseau (le partage de connexion de l’animateur peut aider) ou demande le mode « un seul écran ».';
       const g=$('#go'); if(g){ g.disabled=false; g.textContent='Rejoindre'; }
-    } else scheduleRetry();
+    } else { P.lost=true; renderPlayer(); scheduleRetry(); }
   });
 }
 function scheduleRetry(){ clearTimeout(retryT); retryT=setTimeout(()=>{ if(ROLE==='player'&&P.lost) connectPlayer(false); },3000); }
-function leavePlayer(){ clearTimeout(retryT); if(P.cli) P.cli.destroy(); P.cli=null; ROLE=null; P.st=null; viewHub(); }
+function leavePlayer(){ try{ sessionStorage.removeItem('bh-act'); }catch(e){} clearTimeout(retryT); if(P.cli) P.cli.destroy(); P.cli=null; ROLE=null; P.st=null; viewHub(); }
 function onState(s){
   if(!s || typeof s!=='object') return;
   if(s.e!==P.e){ P.e=s.e; P.q=0; P.hist=[]; P.sel=null; P.seenR=null; }
@@ -226,6 +228,24 @@ function nameOf(st,id){ const x=(st.ro||[]).find(r=>r[0]===id); return x?x[1]:'?
 function idxOf(st,id){ const i=(st.ro||[]).findIndex(r=>r[0]===id); return i<0?0:i; }
 function setChoice(k){ P.sel=k; sendVote(); renderPlayer(); }
 function sendVote(){ if(P.cli && P.st) P.cli.send({t:'vote',pid:P.pid,s:P.sel,rnd:P.st.e+'.'+P.st.r}); }
+function confirmBox(msg,onYes){
+  const cv=document.createElement('div'); cv.className='cover'; cv.setAttribute('role','alertdialog'); cv.setAttribute('aria-label',msg);
+  cv.innerHTML='<div class="wrap" style="justify-content:center;min-height:100vh"><div class="card col" style="text-align:center"><h2 style="font-size:26px">'+esc(msg)+'</h2><div class="row" style="flex-wrap:nowrap"><button class="btn grow" id="cn-yes" style="background:var(--warn);border-color:var(--warn);color:#fff">Oui</button><button class="btn ghost grow" id="cn-no">Non</button></div></div></div>';
+  document.body.appendChild(cv);
+  cv.querySelector('#cn-no').onclick=()=>cv.remove();
+  cv.querySelector('#cn-yes').onclick=()=>{ cv.remove(); onYes(); };
+  cv.querySelector('#cn-no').focus();
+}
+function unitOf(g){ return g.moteur==='comite'?'point':'pas'; }
+function totOf(st,id){ const r=(st.tot||[]).find(x=>x[0]===id); return r?r[1]:0; }
+function scoreBoard(st,g,mine){
+  const u=unitOf(g), rows=(st.ro||[]).map((r,i)=>[r[0],r[1],i,totOf(st,r[0])]).sort((a,b)=>b[3]-a[3]||a[2]-b[2]);
+  return '<div class="card col"><h3 style="font-size:20px">Scores'+(g.moteur==='choix'?' (pas bonus cumulés)':' (points personnels)')+'</h3>'+rows.map(r=>'<div class="pr">'+swatch(r[2])+'<span class="nm" style="'+(r[0]===mine?'text-decoration:underline':'')+'">'+esc(r[1])+(r[0]===st.act?' <span class="tag">actif</span>':'')+'</span><b style="min-width:70px;text-align:right">'+r[3]+' '+u+(r[3]>1?'s':'')+'</b></div>').join('')+'</div>';
+}
+function myScoreCard(st,g,label){
+  const t=totOf(st,P.pid), u=unitOf(g);
+  return '<div class="card col" style="text-align:center"><div class="muted small" style="font-weight:800">'+(label||'TON SCORE')+'</div><div class="big">'+t+'</div><div style="font-weight:800;font-size:18px">'+u+(t>1?'s':'')+(g.moteur==='choix'?' bonus depuis le début':' depuis le début')+'</div></div>';
+}
 function rosterHTML(st,mine){ return '<div class="pl">'+(st.ro||[]).map((r,i)=>'<div class="pr">'+swatch(i)+'<span class="nm">'+esc(r[1])+'</span>'+(r[0]===mine?'<span class="tag">toi</span>':'')+'</div>').join('')+'</div>'; }
 
 function renderPlayer(){
@@ -239,7 +259,7 @@ function renderPlayer(){
   const lostB = P.lost ? '<div class="card err" role="status">Connexion perdue. Reconnexion en cours…</div>' : '';
   $('#app').innerHTML='<div class="wrap">'+head+lostB+body+'<button class="btn ghost sm" id="leave" style="align-self:flex-start">Quitter la partie</button></div>';
   document.querySelectorAll('.op[data-k]').forEach(b=>b.onclick=()=>setChoice(+b.dataset.k));
-  $('#leave').onclick=leavePlayer;
+  $('#leave').onclick=()=>confirmBox('Quitter la partie ?',leavePlayer);
 }
 
 /* ===================================================== Moteur A : « le meilleur choix » */
@@ -250,20 +270,20 @@ function optsCorr(c,choice){ return '<div class="opts">'+c.o.map((o,i)=>'<div cl
 function stepsChoix(c,sel,act){ if(sel==null) return 0; const v=c.o[sel][1]; return v===2?(act?3:1):(v===1&&act?1:0); }
 function resultsChoix(st,g,meId){
   const c=cardOf(g,st.sid);
-  return '<div class="card col"><h3 style="font-size:20px">Les choix de chacun</h3>'+(st.rv||[]).map(r=>{ const v=r[1]==null?null:c.o[r[1]][1]; return '<div class="pr">'+swatch(idxOf(st,r[0]))+'<span class="nm" style="'+(r[0]===meId?'text-decoration:underline':'')+'">'+esc(nameOf(st,r[0]))+(r[0]===st.act?' <span class="tag">actif</span>':'')+'</span><span class="chip" style="background:'+(v===2?'var(--ok);color:#fff':v===1?'#E9A400':'var(--line)')+'">'+(r[1]==null?'—':LET[r[1]])+'</span><b style="min-width:44px;text-align:right">'+(r[3]>0?'+'+r[3]:'0')+'</b></div>'; }).join('')+'</div>';
+  return '<div class="card col"><h3 style="font-size:20px">Les choix de chacun</h3>'+(st.rv||[]).slice().sort((a,b)=>(b[0]===st.act)-(a[0]===st.act)).map(r=>{ const v=r[1]==null?null:c.o[r[1]][1]; return '<div class="pr">'+swatch(idxOf(st,r[0]))+'<span class="nm" style="'+(r[0]===meId?'text-decoration:underline':'')+'">'+esc(nameOf(st,r[0]))+(r[0]===st.act?' <span class="tag">actif</span>':'')+'</span><span class="chip" style="background:'+(v===2?'var(--ok);color:#fff':v===1?'#E9A400':'var(--line)')+'">'+(r[1]==null?'—':LET[r[1]])+'</span><b style="min-width:44px;text-align:right">'+(r[3]>0?'+'+r[3]:'0')+'</b>'+(st.tot?'<span class="muted tiny" style="min-width:62px;text-align:right">total '+totOf(st,r[0])+'</span>':'')+'</div>'; }).join('')+'</div>';
 }
 function playerChoix(st,g){
   let body='';
   if(st.ph==='turn'){
     const mine=st.act===P.pid;
-    body='<div class="card col" style="text-align:center"><div class="muted small" style="font-weight:800">TOUR DE JEU</div><h2 style="font-size:34px">'+(mine?'C’est ton tour':esc(nameOf(st,st.act)))+'</h2><p class="muted">'+(mine?'Lance le dé et avance ton pion. Sur une case « ? », la situation arrive ici.':'Il ou elle lance le dé. Sur une case « ? », une situation arrive ici.')+'</p></div>'+'<div class="card col"><div class="small muted" style="font-weight:800">JOUEURS</div>'+rosterHTML(st,P.pid)+'</div>';
+    body='<div class="card col" style="text-align:center"><div class="muted small" style="font-weight:800">TOUR DE JEU</div><h2 style="font-size:34px">'+(mine?'C’est ton tour':esc(nameOf(st,st.act)))+'</h2><p class="muted">'+(mine?'Lance le dé et avance ton pion. Sur une case « ? », la situation arrive ici.':'Il ou elle lance le dé. Sur une case « ? », une situation arrive ici.')+'</p></div>'+myScoreCard(st,g)+scoreBoard(st,g,P.pid);
   } else if(st.ph==='vote'){
     const c=cardOf(g,st.sid), mine=st.act===P.pid;
     body=cardHTML(c,st.r)+'<div class="card col"><h2 style="font-size:22px">Que fais-tu ?</h2><p class="hint">'+(mine?'Tu es le joueur actif : le meilleur choix te fait avancer de 3 pas.':'Le meilleur choix te fait avancer de 1 pas. Le joueur actif est '+esc(nameOf(st,st.act))+'.')+'</p>'+optsVote(c,P.sel)+
      '<p class="small" style="font-weight:700;color:'+(P.sel!=null?'var(--ok)':'var(--muted)')+'">'+(P.sel!=null?'Choix envoyé. Tu peux le changer jusqu’à la révélation.':'Choisis une réponse, sans en parler.')+'</p></div>';
   } else if(st.ph==='reveal'){
     const c=cardOf(g,st.sid), row=myRow();
-    body='<div class="card col" style="text-align:center"><div class="muted small" style="font-weight:800">TON RÉSULTAT</div><div class="big" style="color:'+(row&&row[3]>0?'var(--ok)':'var(--muted)')+'">'+(row&&row[3]>0?'+'+row[3]:'0')+'</div><div style="font-weight:800;font-size:18px">'+(row&&row[3]>0?'Avance ton pion de '+row[3]+' pas':'Reste sur ta case')+'</div></div>'+
+    body='<div class="card col" style="text-align:center"><div class="muted small" style="font-weight:800">TON RÉSULTAT</div><div class="big" style="color:'+(row&&row[3]>0?'var(--ok)':'var(--muted)')+'">'+(row&&row[3]>0?'+'+row[3]:'0')+'</div><div style="font-weight:800;font-size:18px">'+(row&&row[3]>0?'Avance ton pion de '+row[3]+' pas':'Reste sur ta case')+'<div class="muted" style="font-weight:800">Total : '+totOf(st,P.pid)+' pas bonus depuis le début</div></div>'+
       cardHTML(c,st.r)+'<div class="card col"><h3 style="font-size:20px">Corrigé</h3>'+optsCorr(c,row?row[1]:null)+'<div class="note"><b>À retenir.</b> '+esc(c.w)+'</div></div>'+resultsChoix(st,g,P.pid)+'<p class="hint" style="text-align:center">En attente de l’animateur pour la suite.</p>';
   } else if(st.ph==='end'){
     const me=(st.sm||[]).find(r=>r[0]===P.pid);
@@ -296,7 +316,7 @@ function playerComite(st,g){
   const top='<div class="card col">'+gaugeBar(g,st.ga,st.pg)+roleCard(g,st,P.pid)+'</div>';
   let body='';
   if(st.ph==='turn'){
-    body='<div class="card col" style="text-align:center"><div class="muted small" style="font-weight:800">DÉ DE L’ÉQUIPE · '+st.ev+' / '+C.nev+' événements</div><h2 style="font-size:34px">'+(st.act===P.pid?'C’est à toi de lancer le dé':esc(nameOf(st,st.act))+' lance le dé')+'</h2><p class="muted">Le pion de l’équipe avance. Sur une case « ? », un événement arrive ici.</p></div>';
+    body='<div class="card col" style="text-align:center"><div class="muted small" style="font-weight:800">DÉ DE L’ÉQUIPE · '+st.ev+' / '+C.nev+' événements</div><h2 style="font-size:34px">'+(st.act===P.pid?'C’est à toi de lancer le dé':esc(nameOf(st,st.act))+' lance le dé')+'</h2><p class="muted">Le pion de l’équipe avance. Sur une case « ? », un événement arrive ici.</p></div>'+myScoreCard(st,g)+scoreBoard(st,g,P.pid);
   } else if(st.ph==='vote'){
     const e=C.events[st.sid];
     body=evHTML(e,st.ev,C.nev)+'<div class="card col"><h2 style="font-size:22px">Que proposes-tu à l’équipe ?</h2><p class="hint">Vote en secret. Ensuite, le groupe discute et décide d’une seule option.</p>'+optsComite(e,P.sel)+'<p class="small" style="font-weight:700;color:'+(P.sel!=null?'var(--ok)':'var(--muted)')+'">'+(P.sel!=null?'Vote envoyé. Tu peux le changer jusqu’à la révélation.':'Choisis une option, sans en parler.')+'</p></div>';
@@ -306,7 +326,7 @@ function playerComite(st,g){
   } else if(st.ph==='result'){
     const e=C.events[st.sid], row=myRow(), ri=st.rl?st.rl[P.pid]:null;
     body=evHTML(e,st.ev,C.nev)+'<div class="card col"><h3 style="font-size:20px">Décision et conséquences</h3>'+optsComiteCorr(g,e,st.fin,row?row[1]:null)+'<div class="note"><b>Repère.</b> '+esc(e.rep)+'</div></div>'+
-      '<div class="card col"><h3 style="font-size:20px">Points personnels</h3>'+(st.sc||[]).map(r=>'<div class="pr">'+swatch(idxOf(st,r[0]))+'<span class="nm">'+esc(nameOf(st,r[0]))+'</span><b>+'+r[1]+'</b></div>').join('')+'</div>';
+      '<div class="card col"><h3 style="font-size:20px">Points personnels</h3>'+(st.sc||[]).map(r=>'<div class="pr">'+swatch(idxOf(st,r[0]))+'<span class="nm">'+esc(nameOf(st,r[0]))+'</span><b>+'+r[1]+'</b></div>').join('')+'</div>'+myScoreCard(st,g,'TON TOTAL')+scoreBoard(st,g,P.pid);
   } else if(st.ph==='alea'){
     const a=C.aleas[st.sid];
     body='<div class="card col"><span class="pill" style="background:#8B4FC9;color:#fff;align-self:flex-start">Imprévu</span><h2 style="font-size:26px">'+esc(a.t)+'</h2><p class="sit">'+esc(a.x)+'</p><div>'+fxHTML(g,a.fx)+'</div></div>';
@@ -331,19 +351,20 @@ function endComiteHTML(st,g,mine){
 let G=null, H=null, REM={}, PEERPID={};
 const LOCAL_ONLY = ()=>ROLE==='local';
 function newGame(code,g){
-  const o={e:rid(6),q:0,code,g,ph:'lobby',locals:[],order:[],names:{},act:null,sid:null,r:0,deck:[],hist:[],votes:{},rv:null};
+  const o={e:rid(6),q:0,code,g,ph:'lobby',locals:[],order:[],names:{},act:null,sid:null,r:0,deck:[],hist:[],votes:{},rv:null,cls:defCls(),grp:''};
   if(gameOf(g).moteur==='comite'){ const C=CONTENT[g]; o.ga=C.start.slice(); o.pg=null; o.ev=0; o.rl={}; o.sc={}; o.bonus={}; o.zero=false; o.al=[]; o.log=[]; }
   return o;
 }
 function openHost(code){
   return new Promise((ok,ko)=>{ let n=0;
     const go=()=>{ const h=Host(code,onClientMsg,onClientClose);
-      h.ready.then(()=>ok(h),e=>{ h.destroy(); if(e&&e.type==='unavailable-id'&&n++<6) setTimeout(go,2500); else ko(e); }); };
+      h.ready.then(()=>ok(h),e=>{ h.destroy(); if(e&&e.type==='unavailable-id'&&n++<40) setTimeout(go,2500); else ko(e); }); };
     go(); });
 }
 async function startHost(gid,local){
   ROLE = local?'local':'host';
   const saved = ls('bh-host');
+  if(saved && saved.ph!=='end' && saved.g===gid && !!saved.local===!!local && Date.now()-(saved.ts||0)<8*3600*1000){ begin(saved); return; }
   if(saved && saved.ph!=='end' && saved.g===gid && !!saved.local===!!local){
     VIEW='resume';
     $('#app').innerHTML='<div class="wrap">'+brand()+'<div class="card col"><h2>Une partie est en cours</h2><p class="muted">Code '+esc(saved.code.toUpperCase())+' · '+saved.hist.length+' tour(s) joué(s).</p>'+
@@ -368,7 +389,7 @@ async function startHost(gid,local){
     persist(); hostRender(); emitState();
   }
 }
-function persist(){ if(G) ls('bh-host',G); }
+function persist(){ if(G){ G.ts=Date.now(); ls('bh-host',G); } }
 function onClientMsg(peerId,m){
   if(!G||!m||typeof m!=='object') return;
   if(m.t==='hello'){
@@ -413,6 +434,8 @@ function currentVotes(){
 function stateObj(){
   const ro=roster();
   const pay={t:'state',e:G.e,q:Date.now(),g:G.g,ph:G.ph,sid:G.sid,r:G.r,act:G.act,ro:ro.map(p=>[p.id,p.name])};
+  pay.tot=ro.map(p=>[p.id,isComite()?(G.sc[p.id]||0):statsOf(p.id).steps]);
+  pay.tot=ro.map(p=>[p.id,isComite()?(G.sc[p.id]||0):statsOf(p.id).steps]);
   if(G.ga){ pay.ga=G.ga; pay.pg=G.pg; pay.ev=G.ev; pay.rl=G.rl; }
   if(G.rv&&(G.ph==='reveal'||G.ph==='debate'||G.ph==='result')) pay.rv=G.rv;
   if(G.ph==='result'){ pay.fin=G.fin; pay.sc=G.lastSc; }
@@ -420,7 +443,7 @@ function stateObj(){
   if(G.ph==='end'){ pay.sm=G.sm; pay.vd=G.vd; pay.fs=G.fs; }
   return pay;
 }
-function emitState(){ if(!H||!G) return; H.broadcast(stateObj()); }
+function emitState(){ if(G) sendRep(); if(!H||!G) return; H.broadcast(stateObj()); }
 function stopHost(){ if(H) H.destroy(); H=null; G=null; REM={}; PEERPID={}; ROLE=null; }
 function nextActive(){ const ro=roster(); if(!ro.length) return null; const i=ro.findIndex(p=>p.id===G.act); return ro[(i+1)%ro.length].id; }
 const isComite = ()=>gameOf(G.g).moteur==='comite';
@@ -432,10 +455,7 @@ function setPhase(ph){ G.ph=ph; persist(); hostRender(); emitState(); window.scr
 function hostBar(){ return brand('<button class="btn ghost sm" id="hq">Terminer</button>',gameOf(G.g).titre.toUpperCase()); }
 function bindBar(){
   const b=$('#hq'); if(!b) return;
-  b.onclick=()=>{
-    if(b.dataset.armed){ endGame(); return; }
-    b.dataset.armed='1'; b.textContent='Confirmer la fin'; b.style.borderColor='var(--warn)'; setTimeout(()=>{ if(b.isConnected){ b.dataset.armed=''; b.textContent='Terminer'; b.style.borderColor=''; } },3500);
-  };
+  b.onclick=()=>confirmBox('Terminer la partie ?',()=>endGame());
 }
 function playersHTML(opts){
   const ro=roster();
@@ -458,6 +478,7 @@ function hostLobby(){
    '<div class="row" style="align-items:flex-start;gap:18px"><div><div class="muted small" style="font-weight:800">CODE DE LA PARTIE</div><div class="code">'+esc(G.code.toUpperCase())+'</div></div>'+
    '<div id="qr" style="background:#fff;padding:8px;border-radius:10px;width:150px;height:150px;flex:none" aria-label="QR code de connexion">'+qrSVG(joinURL(G.code,G.g))+'</div></div>'+
    '<p class="muted">Les joueurs scannent le QR code (ou ouvrent <b>'+esc(location.host+location.pathname)+'</b>, « Rejoindre une partie ») et saisissent ce code et leur prénom.</p>')+
+   '<div class="soft col"><div class="small" style="font-weight:800">Suivi par l’enseignant (facultatif)</div><div class="row" style="flex-wrap:nowrap"><input type="text" id="gcls" maxlength="4" placeholder="Code classe" value="'+esc((G.cls||'').toUpperCase())+'" style="text-transform:uppercase;letter-spacing:.2em;max-width:130px" aria-label="Code classe"><input type="text" id="ggrp" maxlength="20" placeholder="Nom de l’équipe" value="'+esc(G.grp||'')+'" aria-label="Nom de l’équipe"></div><div class="tiny muted" id="pst" style="font-weight:700">'+esc(profStatusText())+'</div></div>'+
    '<div class="soft small"><b>Règle en bref.</b><ol style="margin:6px 0 0;padding-left:20px">'+g.regle.map(o=>'<li>'+esc(o)+'</li>').join('')+'</ol></div>'+
    '<p class="err small" id="warn" hidden>Plus de 5 joueurs : les pions n’existent qu’en 5 couleurs. Formez des équipes qui partagent un téléphone.</p>'+
    '</div><div class="card col"><div class="row" style="justify-content:space-between"><h3 style="font-size:22px">Joueurs (<span id="cnt">0</span>)</h3></div><div class="pl" id="plist"></div>'+
@@ -466,6 +487,8 @@ function hostLobby(){
   bindBar(); updatePlayers();
   const add=()=>{ const v=$('#ln').value.trim(); if(!v) return; G.locals.push({id:'L'+rid(4),name:v.slice(0,18)}); $('#ln').value=''; persist(); updatePlayers(); emitState(); $('#ln').focus(); };
   $('#la').onclick=add; $('#ln').onkeydown=e=>{ if(e.key==='Enter') add(); };
+  const setCls=()=>{ G.cls=($('#gcls').value||'').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,4); G.grp=($('#ggrp').value||'').trim().slice(0,20); try{ if(G.cls.length===4) sessionStorage.setItem('bh-cls',G.cls); }catch(e){} persist(); sendRep(); const q=$('#pst'); if(q) q.textContent=profStatusText(); };
+  $('#gcls').oninput=setCls; $('#ggrp').oninput=setCls; setCls();
   $('#start').onclick=()=>{ const ro=roster(); G.act=ro[0].id; if(isComite()) assignRoles(); setPhase('turn'); };
 }
 function assignRoles(){
@@ -475,8 +498,9 @@ function assignRoles(){
 function votedCount(){ return Object.keys(currentVotes()).length; }
 function updateVotes(){
   const el=$('#vlist'); if(!el) return; const v=currentVotes(), ro=roster();
-  el.innerHTML=ro.map((p,i)=>'<div class="pr">'+swatch(i)+'<span class="nm">'+esc(p.name)+(p.id===G.act&&!isComite()?' <span class="tag">actif</span>':'')+'</span>'+
-    (v[p.id]?'<span class="tag on">a répondu</span>':'<span class="tag">…</span>')+
+  const order=ro.map((p,i)=>[p,i]).sort((a,b)=>(b[0].id===G.act)-(a[0].id===G.act)||a[1]-b[1]);
+  el.innerHTML=order.map(([p,i])=>'<div class="pr">'+swatch(i)+'<span class="nm">'+esc(p.name)+(p.id===G.act?' <span class="tag">actif</span>':'')+'</span>'+
+    (v[p.id]?'<span class="chip" style="background:var(--ink);color:var(--bg);min-width:34px;text-align:center">'+LET[v[p.id].s]+'</span>':'<span class="tag">…</span>')+
     (p.local?'<button class="btn sm '+(v[p.id]?'ghost':'')+'" data-v="'+esc(p.id)+'">'+(v[p.id]?'Modifier':'Voter')+'</button>':'')+'</div>').join('');
   el.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>localVote(b.dataset.v));
   const n=Object.keys(v).length, rb=$('#rev'); if(rb){ rb.disabled=n<1; rb.textContent=(isComite()?'Révéler les votes (':'Révéler le corrigé (')+n+'/'+ro.length+')'; }
@@ -513,7 +537,7 @@ function hostTurn(){
    '<h2 style="font-size:40px">'+swatch(ai)+' '+esc(actName)+'</h2><p class="muted">lance le dé et avance son pion.</p>'+
    '<button class="btn block" id="draw">Case « ? » : tirer une situation</button>'+
    '<p class="hint">Case Imprévu : dé pair, avancez de 2 cases ; dé impair, reculez d’1 case. Case Pause café : on rejoue. Puis passez au joueur suivant.</p>'+
-   '<button class="btn ghost block" id="skip">Passer au joueur suivant</button></div>'+
+   '<button class="btn ghost block" id="skip">Passer au joueur suivant</button></div>'+scoreBoard(Object.assign(stateObj(),{act:G.act}),g,null)+
    '<div class="card col"><div class="small muted" style="font-weight:800">CHANGER LE JOUEUR ACTIF</div><div class="row" id="act">'+ro.map((p,i)=>'<button class="btn sm ghost'+(p.id===G.act?'':'')+'" style="'+(p.id===G.act?'border-color:var(--ink)':'')+'" data-a="'+esc(p.id)+'">'+swatch(i)+' '+esc(p.name)+'</button>').join('')+'</div></div></div>';
   bindBar();
   document.querySelectorAll('#act [data-a]').forEach(b=>b.onclick=()=>{ G.act=b.dataset.a; persist(); hostTurn(); emitState(); });
@@ -541,11 +565,11 @@ function reveal(){
 }
 function hostReveal(){
   const g=gameOf(G.g), c=CONTENT[g.id].cards[G.sid];
-  const fake={ro:roster().map(p=>[p.id,p.name]),rv:G.rv,act:G.act,sid:G.sid};
+  const fake={ro:roster().map(p=>[p.id,p.name]),rv:G.rv,act:G.act,sid:G.sid,tot:stateObj().tot};
   $('#app').innerHTML='<div class="wrap wide">'+hostBar()+
    '<div class="two"><div class="col">'+cardHTML(c,G.r)+'<div class="card col"><h3 style="font-size:20px">Corrigé</h3>'+optsCorr(c,null)+'<div class="note"><b>À retenir.</b> '+esc(c.w)+'</div></div></div><div class="col">'+
    resultsChoix(fake,g,null)+'<p class="hint">Chacun avance son pion du nombre de pas indiqué. Les pas bonus ne déclenchent aucune case. Animez la discussion : qui a hésité, et pourquoi ?</p>'+
-   '<button class="btn block" id="nx">Joueur suivant</button></div></div></div>';
+   '<button class="btn block" id="nx">Question suivante (joueur suivant)</button></div></div></div>';
   bindBar();
   $('#nx').onclick=()=>{ G.act=nextActive(); setPhase('turn'); };
 }
@@ -581,7 +605,7 @@ function hostEnd(){
    (miss.length?'<p><b>Situations qui ont divisé ou trompé le groupe :</b></p>'+miss.map(x=>'<div class="soft small"><b>'+esc(c[x.h.i].t)+'</b> · '+esc(c[x.h.i].x.slice(0,120))+'…<br><span class="muted">À retenir : '+esc(c[x.h.i].w)+'</span></div>').join(''):'')+
    '<div class="note small">'+esc(g.debrief)+'</div>'+
    '<button class="btn ghost" id="csv">Télécharger le détail (CSV)</button></div></div></div>';
-  $('#nw').onclick=()=>{ const gid=G.g; stopHost(); viewGame(gid); };
+  $('#nw').onclick=()=>confirmBox('Fermer ce bilan et lancer une nouvelle partie ?',()=>{ const gid=G.g; stopHost(); viewGame(gid); });
   $('#csv').onclick=()=>{ const L=[['situation','theme','joueur','joueur_actif','reponse','resultat','pas']]; G.hist.forEach(h=>{ const cc=c[h.i]; h.rows.forEach(r=>{ const v=r[1]==null?'':cc.o[r[1]][1]; L.push([h.r,cc.t,G.names[r[0]]||'?',r[0]===h.act?'oui':'non',r[1]==null?'':LET[r[1]],v===2?'meilleur choix':v===1?'acceptable':v===''?'pas de réponse':'à revoir',r[3]]); }); }); csvDownload(G.g+'-'+G.code+'.csv',toCSV(L)); };
 }
 
@@ -596,7 +620,7 @@ function hostTurnC(){
    '<div class="row" style="flex-wrap:nowrap"><button class="btn ghost grow" id="al">Case Imprévu</button><button class="btn ghost grow" id="pz">Case Pause café</button></div>'+
    '<button class="btn ghost block" id="skip">Passer au joueur suivant</button>'+
    (G.ev>=C.nev?'<div class="soft"><b>Objectif de durée atteint.</b> Vous pouvez terminer la partie (bouton en haut) ou jouer un événement de plus.</div>':'')+'</div></div>'+
-   '<div class="card col">'+gaugesNow()+'<p class="hint">Le pion de l’équipe fait un tour du plateau (36 cases), puis la partie se termine.</p></div></div></div>';
+   '<div class="col"><div class="card col">'+gaugesNow()+'<p class="hint">Le pion de l’équipe fait un tour du plateau (36 cases), puis la partie se termine.</p></div>'+scoreBoard(Object.assign(stateObj(),{act:G.act}),g,null)+'</div></div></div>';
   bindBar();
   $('#draw').onclick=drawEvent; $('#skip').onclick=()=>{ G.act=nextActive(); persist(); hostTurnC(); emitState(); };
   $('#al').onclick=()=>{ const C2=CONTENT[G.g]; G.sid=dealCard('a',C2.aleas.length); G.r++; applyFx(C2.aleas[G.sid].fx); G.log.push({k:'alea',i:G.sid}); if(!checkZero()) setPhase('alea'); };
@@ -658,8 +682,8 @@ function hostResult(){
   const g=gameOf(G.g), C=CONTENT[g.id], e=C.events[G.sid], ro=roster();
   $('#app').innerHTML='<div class="wrap wide">'+hostBar()+
    '<div class="two"><div class="col">'+evHTML(e,G.ev,C.nev)+'<div class="card col"><h3 style="font-size:20px">Décision et conséquences</h3>'+optsComiteCorr(g,e,G.fin,null)+'<div class="note"><b>Repère.</b> '+esc(e.rep)+'</div></div></div>'+
-   '<div class="col"><div class="card col">'+gaugesNow()+'</div><div class="card col"><h3 style="font-size:20px">Points personnels de cet événement</h3>'+(G.lastSc||[]).map(r=>'<div class="pr">'+swatch(ro.findIndex(p=>p.id===r[0]))+'<span class="nm">'+esc(G.names[r[0]]||'?')+'</span><b>+'+r[1]+'</b></div>').join('')+'</div>'+
-   '<button class="btn block" id="nx">Joueur suivant</button></div></div></div>';
+   '<div class="col"><div class="card col">'+gaugesNow()+'</div><div class="card col"><h3 style="font-size:20px">Points personnels (cet événement, total)</h3>'+(G.lastSc||[]).slice().sort((a,b)=>(b[0]===G.act)-(a[0]===G.act)).map(r=>'<div class="pr">'+swatch(ro.findIndex(p=>p.id===r[0]))+'<span class="nm">'+esc(G.names[r[0]]||'?')+(r[0]===G.act?' <span class="tag">actif</span>':'')+'</span><b>+'+r[1]+'</b><span class="muted tiny" style="min-width:62px;text-align:right">total '+(G.sc[r[0]]||0)+'</span></div>').join('')+'</div>'+
+   '<button class="btn block" id="nx">Événement suivant (joueur suivant)</button></div></div></div>';
   bindBar(); $('#nx').onclick=()=>{ G.act=nextActive(); setPhase('turn'); };
 }
 function hostAlea(){
@@ -691,11 +715,128 @@ function hostEndC(){
    '<p>'+ev.length+' événement'+(ev.length>1?'s':'')+' décidé'+(ev.length>1?'s':'')+', dont <b>'+rec+'</b> avec l’option recommandée et <b>'+split+'</b> avec des votes partagés.</p>'+
    '<p>Jauge la plus basse : <b>'+esc(low[0])+'</b> ('+low[1]+'/10).</p>'+
    '<div class="note small">'+esc(g.debrief)+'</div><button class="btn ghost" id="csv">Télécharger le détail (CSV)</button></div></div></div></div>';
-  $('#nw').onclick=()=>{ const gid=G.g; stopHost(); viewGame(gid); };
+  $('#nw').onclick=()=>confirmBox('Fermer ce bilan et lancer une nouvelle partie ?',()=>{ const gid=G.g; stopHost(); viewGame(gid); });
   $('#csv').onclick=()=>{ const L=[['evenement','theme','decision','recommandee','votes']]; ev.forEach((x,n)=>{ const e=C.events[x.i]; L.push([n+1,e.t,LET[x.fin]+' '+e.o[x.fin].t,x.rec?'oui':'non',x.votes.map(v=>(G.names[v[0]]||'?')+':'+(v[1]==null?'-':LET[v[1]])).join(' | ')]); }); csvDownload(G.g+'-'+G.code+'.csv',toCSV(L)); };
 }
 window.__BH={get G(){return G}};
-const q0=qs.get('g'), r0=qs.get('room');
-if(r0 && hasPeer) viewJoin(r0,q0&&gameOf(q0)?q0:''); else if(q0&&gameOf(q0)) viewGame(q0); else viewHub();
+
+/* ===================================================== Robustesse : sortie, veille, reconnexion */
+const inGameHost = ()=>(ROLE==='host'||ROLE==='local') && G && G.ph!=='end';
+window.addEventListener('beforeunload',e=>{ if(inGameHost()){ e.preventDefault(); e.returnValue=''; return ''; } });
+try{ history.pushState({bh:1},''); }catch(e){}
+window.addEventListener('popstate',()=>{
+  const busy = inGameHost() || ROLE==='player';
+  if(!busy){ history.back(); return; }
+  try{ history.pushState({bh:1},''); }catch(e){}
+  if(document.querySelector('.cover')) return;
+  if(inGameHost()) confirmBox('Terminer la partie ? Les joueurs seront coupés.',()=>endGame()); else confirmBox('Quitter la partie ?',leavePlayer);
+});
+let WL=null;
+async function keepAwake(){ try{ if(navigator.wakeLock && !document.hidden && !WL && (inGameHost()||ROLE==='player'||ROLE==='prof')){ WL=await navigator.wakeLock.request('screen'); WL.addEventListener('release',()=>{ WL=null; }); } }catch(e){ WL=null; } }
+let HOK=Date.now(), REVIVING=false;
+function reviveHost(){
+  if(ROLE!=='host'||!G||G.ph==='end'||!H||REVIVING) return;
+  if(H.ok()){ HOK=Date.now(); return; }
+  H.reconnect();
+  if(H.dead()||Date.now()-HOK>15000){
+    REVIVING=true; try{ H.destroy(); }catch(e){}
+    openHost(G.code).then(h=>{ H=h; HOK=Date.now(); REVIVING=false; emitState(); },()=>{ REVIVING=false; });
+  }
+}
+function checkPlayer(force){
+  if(ROLE!=='player'||!P.cli||P.lost) return;
+  if(Date.now()-(P.last||0)>(force?6000:13000)){ P.lost=true; renderPlayer(); connectPlayer(false); }
+}
+setInterval(()=>{ keepAwake(); if(ROLE==='host'&&G&&H){ reviveHost(); if(H.ok()) H.broadcast({t:'ping'}); } if((ROLE==='host'||ROLE==='local')&&G) sendRep(); const ps=document.getElementById('pst'); if(ps) ps.textContent=profStatusText(); checkPlayer(false); },4000);
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden){ keepAwake(); reviveHost(); checkPlayer(true); } });
+window.addEventListener('online',()=>{ reviveHost(); checkPlayer(true); });
+
+/* ===================================================== Suivi enseignant (écran projeté) */
+const PRF={peer:null,conn:null,cls:null,busy:false,last:0};
+function defCls(){ let c=''; try{ c=qs.get('classe')||sessionStorage.getItem('bh-cls')||''; }catch(e){} return String(c).toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,4); }
+function profClose(){ try{ if(PRF.peer) PRF.peer.destroy(); }catch(e){} PRF.peer=null; PRF.conn=null; PRF.busy=false; }
+function profEnsure(){
+  if(!G||!G.cls||G.cls.length!==4||!hasPeer) return;
+  if(PRF.cls!==G.cls){ profClose(); PRF.cls=G.cls; }
+  if(PRF.conn&&PRF.conn.open) return;
+  if(PRF.busy&&Date.now()-PRF.last<12000) return;
+  PRF.busy=true; PRF.last=Date.now();
+  try{ if(PRF.peer) PRF.peer.destroy(); }catch(e){}
+  const peer=new Peer(undefined,PO); PRF.peer=peer;
+  peer.on('open',()=>{ const c=peer.connect('BHT-'+PRF.cls,{reliable:true}); PRF.conn=c;
+    c.on('open',()=>{ PRF.busy=false; sendRep(); });
+    c.on('close',()=>{ if(PRF.conn===c){ PRF.conn=null; PRF.busy=false; } });
+    c.on('error',()=>{ PRF.busy=false; }); });
+  peer.on('error',()=>{ PRF.busy=false; });
+}
+function buildRep(){
+  const g=gameOf(G.g), ro=roster(), st=stateObj(), act=(ro.find(p=>p.id===G.act)||{}).name||'';
+  const o={t:'rep',id:G.code,gn:G.grp||('Équipe '+G.code.toUpperCase()),gm:g.titre,mo:g.moteur,ph:G.ph,act:act,vn:Object.keys(currentVotes()).length,np:ro.length,pl:st.tot.map(r=>[G.names[r[0]]||'?',r[1]])};
+  if(isComite()){ const C=CONTENT[G.g]; o.sit=G.ev; o.nev=C.nev; o.ga=C.gauges.map((x,i)=>[x.n,G.ga[i]]); }
+  else { o.sit=G.hist.length; o.th=themeStats().map(r=>[r[0],r[2],r[1]]); }
+  return o;
+}
+function sendRep(){
+  if(!G||!G.cls) return; profEnsure();
+  const c=PRF.conn; if(c&&c.open){ try{ c.send(buildRep()); }catch(e){} }
+}
+function profStatusText(){ return !G||!G.cls?'Non relié':(PRF.conn&&PRF.conn.open?'Relié à l’enseignant':'Connexion à l’enseignant…'); }
+function viewProf(){
+  VIEW='prof'; ROLE='prof';
+  let sv=ls('bh-prof'); if(!sv||!sv.code){ sv={code:rid(4),g:''}; ls('bh-prof',sv); }
+  const code=sv.code, GR={}; let peer=null, tries=0, up=false, dup=false;
+  const games=GAMES.filter(x=>!x.ext);
+  if(!sv.g||!games.find(x=>x.id===sv.g)){ sv.g=(qs.get('g')&&gameOf(qs.get('g'))&&!gameOf(qs.get('g')).ext)?qs.get('g'):games[0].id; ls('bh-prof',sv); }
+  const phLabel=r=>{ if(r.off) return 'Déconnecté'; if(Date.now()-r.seen>20000) return 'Pas de signal'; return ({lobby:'Salon d’attente',turn:'Tour de '+(r.act||'?'),vote:'Vote : '+r.vn+'/'+r.np,reveal:'Corrigé en cours',debate:'Débat',result:'Décision',alea:'Imprévu',pause:'Pause café',end:'Terminé'})[r.ph]||r.ph; };
+  const open=()=>{
+    peer=new Peer('BHT-'+code,PO);
+    peer.on('open',()=>{ up=true; dup=false; draw(); });
+    peer.on('error',e=>{ up=false; if(e&&e.type==='unavailable-id'&&tries>2) dup=true; if(e&&e.type==='unavailable-id'&&tries++<40){ setTimeout(()=>{ try{peer.destroy()}catch(_){} open(); },2500); } draw(); });
+    peer.on('disconnected',()=>{ up=false; setTimeout(()=>{ try{ if(!peer.destroyed) peer.reconnect(); }catch(_){} },1500); });
+    peer.on('connection',c=>{
+      c.on('data',d=>{ if(d&&d.t==='rep'&&d.id){ c.__g=d.id; GR[d.id]=Object.assign({},d,{seen:Date.now()}); draw(); } });
+      c.on('close',()=>{ if(c.__g&&GR[c.__g]){ GR[c.__g].off=true; draw(); } });
+    });
+  };
+  const draw=()=>{
+    if(VIEW!=='prof') return;
+    const gs=Object.values(GR).sort((a,b)=>a.gn.localeCompare(b.gn,'fr',{numeric:true}));
+    const nP=gs.reduce((a,g)=>a+g.pl.length,0), cur=gameOf(sv.g);
+    const T={}; gs.forEach(g=>(g.th||[]).forEach(r=>{ T[r[0]]=T[r[0]]||[0,0]; T[r[0]][0]+=r[1]; T[r[0]][1]+=r[2]; }));
+    const themes=Object.keys(T).filter(k=>T[k][1]>0).map(k=>[k,T[k][0],T[k][1]]).sort((a,b)=>a[1]/a[2]-b[1]/b[2]);
+    const tile=g=>{ const pl=g.pl.slice().sort((a,b)=>b[1]-a[1]), live=!g.off&&Date.now()-g.seen<=20000, u=g.mo==='comite'?'pt':'pas';
+      return '<div class="pt" style="opacity:'+(live?1:.55)+'"><div class="row" style="justify-content:space-between;align-items:center"><b class="pn">'+esc(g.gn)+'</b><span class="tag'+(g.ph==='vote'?' on':'')+'">'+esc(phLabel(g))+'</span></div>'+
+        '<div class="muted small" style="font-weight:700">'+(g.mo==='comite'?'Événement '+g.sit+' / '+g.nev:g.sit+' situation'+(g.sit>1?'s':'')+' jouée'+(g.sit>1?'s':''))+' · '+g.np+' joueur'+(g.np>1?'s':'')+' connecté'+(g.np>1?'s':'')+'</div>'+
+        (g.ga?'<div class="row" style="gap:6px">'+g.ga.map(x=>'<span class="chip" style="background:'+(x[1]<=2?'var(--warn)':'var(--line)')+';color:'+(x[1]<=2?'#fff':'var(--ink)')+'">'+esc(x[0])+' '+x[1]+'</span>').join('')+'</div>':'')+
+        (pl.length?pl.map((p,i)=>'<div class="pr"><span class="nm">'+(i===0&&p[1]>0?'🏆 ':'')+esc(p[0])+'</span><b style="min-width:72px;text-align:right">'+p[1]+' '+u+'</b></div>').join(''):'<div class="muted small">Aucun joueur pour l’instant.</div>')+'</div>'; };
+    $('#app').innerHTML='<style>.pg{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px}.pt{background:var(--card,#fff);border:1.5px solid var(--line);border-radius:16px;padding:16px;display:flex;flex-direction:column;gap:8px}.pn{font-size:clamp(20px,2.2vw,30px)}.pt .pr{font-size:clamp(16px,1.5vw,22px)}.pcode{font-family:var(--f-title);font-size:clamp(40px,6vw,84px);letter-spacing:.12em;line-height:1}</style>'+
+      '<div class="wrap wide">'+brand('<button class="btn ghost sm" id="fs">Plein écran</button>','SUIVI DE LA CLASSE')+
+      '<div class="card" style="display:flex;flex-wrap:wrap;gap:20px;align-items:center;justify-content:space-between"><div><div class="muted small" style="font-weight:800">CODE CLASSE</div><div class="pcode">'+esc(code.toUpperCase())+'</div>'+
+      '<label class="small" style="font-weight:800;display:block;margin-top:10px">Jeu de la séance <select id="gsel" style="margin-left:6px;padding:6px;border-radius:8px;font-size:16px">'+games.map(x=>'<option value="'+x.id+'"'+(x.id===sv.g?' selected':'')+'>'+String(x.no).padStart(2,'0')+' · '+esc(x.titre)+'</option>').join('')+'</select></label>'+
+      '<div class="muted small" style="font-weight:700;margin-top:6px">'+(up?'Écran en ligne':'Connexion en cours…')+' · '+gs.length+' équipe'+(gs.length>1?'s':'')+' · '+nP+' joueur'+(nP>1?'s':'')+'</div></div>'+
+      '<div style="text-align:center"><div style="background:#fff;padding:8px;border-radius:10px;width:150px;height:150px" aria-label="QR code classe">'+qrSVG(BASE+'?classe='+code+'&g='+sv.g)+'</div></div></div>'+
+      '<div style="background:var(--warn);color:#fff;border-radius:14px;padding:14px 18px;text-align:center;font-family:var(--f-title);font-weight:800;font-size:clamp(20px,2.9vw,40px);line-height:1.15">Seuls les animateurs scannent ce QR code !!!<div style="font-size:.5em;font-weight:700;margin-top:4px">Un seul élève par équipe. Les autres joueurs attendent le QR code de leur animateur.</div></div>'+
+      (dup?'<div class="card err" role="alert">Ce code classe est déjà affiché sur un autre écran enseignant. Il ne peut y avoir qu’un seul écran actif : fermez l’autre page (après un rechargement, patientez une minute).</div>':'')+
+      (gs.length?'<div class="pg">'+gs.map(tile).join('')+'</div>':'<div class="card"><h2>En attente des équipes</h2><p class="muted">Un animateur par équipe scanne le QR code ci-dessus : sa partie « '+esc(cur.titre)+' » est créée automatiquement sur son téléphone, il donne un nom à son équipe et montre le QR code de l’équipe aux autres joueurs.</p></div>')+
+      (themes.length?'<div class="card col"><h3 style="font-size:22px">Réussite de la classe par thème (du plus difficile au plus facile)</h3>'+themes.map(r=>'<div class="pr"><span class="nm">'+esc(r[0])+'</span><span class="muted tiny">'+r[2]+' réponses</span><b style="min-width:64px;text-align:right">'+pct(r[1],r[2])+'</b></div>').join('')+'</div>':'')+
+      '<div class="row"><button class="btn ghost sm" id="clr">Effacer les équipes</button></div></div>';
+    $('#fs').onclick=()=>{ try{ if(document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen(); }catch(e){} };
+    $('#clr').onclick=()=>confirmBox('Effacer toutes les équipes affichées ?',()=>{ Object.keys(GR).forEach(k=>delete GR[k]); draw(); });
+    $('#gsel').onchange=e=>{ sv.g=e.target.value; ls('bh-prof',sv); Object.keys(GR).forEach(k=>delete GR[k]); draw(); };
+  };
+  open(); draw(); setInterval(()=>{ if(VIEW==='prof'&&!document.activeElement.matches('select')) draw(); },5000);
+}
+(function(){
+  if(qs.get('prof')){ viewProf(); return; }
+  let act=null, sv=ls('bh-host'); try{ act=sessionStorage.getItem('bh-act'); }catch(e){}
+  const q0=qs.get('g'), r0=qs.get('room'), c0=qs.get('classe');
+  if(c0){ try{ sessionStorage.setItem('bh-cls',defCls()); }catch(e){} }
+  if(c0 && sv && sv.cls!==defCls()){ ls('bh-host',null); sv=null; }
+  if(sv && sv.ph!=='end' && Date.now()-(sv.ts||0)<8*3600*1000 && (hasPeer||sv.local)){ startHost(sv.g,!!sv.local); return; }
+  const pl=ls('bh-player');
+  if(act && pl && pl.code && pl.name && hasPeer){ viewJoin(pl.code,pl.g||''); const g=$('#go'); if(g) g.click(); return; }
+  if(c0 && !r0 && q0 && gameOf(q0) && !gameOf(q0).ext && hasPeer){ startHost(q0,false); return; }
+  if(r0 && hasPeer) viewJoin(r0,q0&&gameOf(q0)?q0:''); else if(q0&&gameOf(q0)) viewGame(q0); else viewHub();
+})();
 </script>
 </body></html>
